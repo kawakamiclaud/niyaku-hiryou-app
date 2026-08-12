@@ -8070,7 +8070,7 @@ function ProductModal2({product,onSave,onClose}){
         </div>
         <div className="form-row"><label>税率</label>
           <select value={p.taxRate||0.1} onChange={e=>set("taxRate",Number(e.target.value))}>
-            <option value="0.08">8% 軽減</option><option value="0.10">10% 標準</option>
+            <option value="0.08">8% 軽減</option><option value="0.1">10% 標準</option>
           </select>
         </div>
         <div className="form-row"><label>備考</label><input value={p.note||""} onChange={e=>set("note",e.target.value)}/></div>
@@ -8442,7 +8442,7 @@ function PriceModal({price,data,onSave,onClose}){
           <div className="form-row"><label>単価(税抜)</label><input type="number" value={p.unitPrice||0} onChange={e=>set("unitPrice",Number(e.target.value))}/></div>
           <div className="form-row"><label>税率</label>
             <select value={p.taxRate||0.1} onChange={e=>set("taxRate",Number(e.target.value))}>
-              <option value="0.08">8% 軽減</option><option value="0.10">10% 標準</option>
+              <option value="0.08">8% 軽減</option><option value="0.1">10% 標準</option>
             </select>
           </div>
           <div className="form-row"><label>適用開始日 *</label><input type="date" value={p.startDate||""} onChange={e=>set("startDate",e.target.value)}/></div>
@@ -8714,7 +8714,7 @@ function QuotationModal({record,data,update,onSave,onClose}){
               <input readOnly value={it.unit||""} style={{background:"#F5F7FA",textAlign:"center"}}/>
               <input type="number" placeholder="販売単価" value={it.salePrice||""} onChange={e=>updateItem(i,"salePrice",e.target.value)}/>
               <select value={it.taxRate!==undefined?it.taxRate:0.1} onChange={e=>updateItem(i,"taxRate",Number(e.target.value))}>
-                <option value="0.08">8%</option><option value="0.10">10%</option>
+                <option value="0.08">8%</option><option value="0.1">10%</option>
               </select>
               <input type="number" placeholder="値引額" value={it.discountAmount||""} onChange={e=>updateItem(i,"discountAmount",e.target.value)}/>
               <input readOnly value={"¥"+(it.amount||0).toLocaleString()} style={{background:"#DDE6F0",fontWeight:"bold",textAlign:"right"}}/>
