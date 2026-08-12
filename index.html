@@ -73,11 +73,14 @@ input:focus,select:focus{outline:none;border-color:#1F4E79}
 .print-page-wrap{position:fixed;inset:0;background:#fff;z-index:300;overflow:auto;padding:20px 0}
 .print-page{width:210mm;min-height:297mm;margin:0 auto 20px;background:#fff;padding:15mm;box-shadow:0 2px 10px rgba(0,0,0,0.15);font-size:12px;color:#222}
 .print-page table{font-size:11px}
+.print-page table td,.print-page table th{overflow-wrap:break-word;word-break:break-word}
 .print-page h2{color:#222;border:none}
 @media print{
   body *{visibility:hidden}
   .print-page-wrap,.print-page-wrap *{visibility:visible}
-  .print-page-wrap{position:absolute;top:0;left:0;width:100%;padding:0}
+  /* 画面用ルールのinset:0(bottom/right含む)とoverflow:autoが印刷時も残ると、
+     内容が1ページ分の高さを超えた時にそこから先が見切れて印刷されないため、明示的に解除する */
+  .print-page-wrap{position:absolute;top:0;left:0;right:auto;bottom:auto;width:100%;height:auto;padding:0;overflow:visible}
   .print-page{width:210mm;min-height:auto;box-shadow:none;margin:0;padding:15mm}
   .no-print{display:none !important}
   .print-page table tr{break-inside:avoid}
