@@ -49,6 +49,7 @@ input:focus,select:focus{outline:none;border-color:#1F4E79}
 .badge-hiryou{background:#DDE6F0;color:#1F4E79}
 .badge-nouyaku{background:#FCE4D6;color:#C05621}
 .badge-partial_delivered{background:#FFE5B4;color:#B45309}
+.badge-cancelled{background:#F8D7DA;color:#DC3545}
 .search input{width:100%;padding:7px 10px}
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:100}
 .modal{background:#fff;border-radius:8px;padding:20px;width:1100px;max-width:97vw;max-height:92vh;overflow:auto}
@@ -5659,7 +5660,7 @@ function TransactionsTab({data,update}){
       <table>
         <thead><tr>
           <th>取引No.</th><th>日付</th><th>お客様(受注)</th><th>メーカー(発注)</th><th>産地</th>
-          <th>品目</th>
+          <th>品目</th><th>納品予定日</th>
           <th className="text-right">受注合計</th>
           <th className="text-right">発注合計</th>
           <th className="text-right">粗利</th>
@@ -5677,6 +5678,7 @@ function TransactionsTab({data,update}){
               <td>{s?.name||"-"}</td>
               <td>{t.sanchi}</td>
               <td style={{fontSize:11}}>{itemSummary(t.items, data.products)}</td>
+              <td>{t.plannedDeliveryDate?fmtDate(t.plannedDeliveryDate):"-"}</td>
               <td className="text-right price">{yen(t.totalSaleAmount)}</td>
               <td className="text-right price">{yen(t.totalPurchaseAmount)}</td>
               <td className={"text-right "+(g>=0?"profit":"loss")}>{yen(g)}</td>
@@ -8567,13 +8569,17 @@ function QuotationsTab({data,update}){
           {list.map(q=>{
             const c = data.partners.find(p=>p.id===q.customerId);
             const totals = computeQuotationTotals(q, data.products);
+            const linkedTx = q.convertedTransactionId ? data.transactions.find(t=>t.id===q.convertedTransactionId) : null;
             return <tr key={q.id}>
               <td>{q.quotationNo}</td>
               <td>{fmtDate(q.quotationDate)}</td>
               <td>{c?.name||"-"}</td>
               <td style={{fontSize:11}}>{itemSummary(q.items, data.products)}</td>
               <td className="text-right price">{yen(totals.taxIncludedTotal)}</td>
-              <td><span className={"badge "+(q.status==="ordered"?"badge-invoiced":q.status==="draft"?"badge-created":"badge-hiryou")}>{QUOTATION_STATUS_LABEL[q.status]||q.status}</span></td>
+              <td>
+                <span className={"badge "+(q.status==="ordered"?"badge-invoiced":q.status==="draft"?"badge-created":"badge-hiryou")}>{QUOTATION_STATUS_LABEL[q.status]||q.status}</span>
+                {linkedTx?.status==="cancelled" && <span className="badge badge-cancelled" style={{marginLeft:4}}>受注取消済</span>}
+              </td>
               <td>
                 <button className="btn btn-secondary btn-sm" onClick={()=>setEditing(q)}>{q.status==="ordered"?"表示":"編集"}</button>
                 <button className="btn btn-secondary btn-sm" style={{marginLeft:4}} onClick={()=>handlePrint(q)}>印刷/PDF</button>
@@ -8741,6 +8747,8 @@ function QuotationModal({record,data,update,onSave,onClose}){
         <div className="form-row"><label>社内メモ</label><input value={q.internalMemo||""} onChange={e=>set("internalMemo",e.target.value)}/></div>
 
         {q.convertedTransactionId && <div style={{background:"#DEEBF7",color:"#1565C0",padding:8,borderRadius:4,marginBottom:8,fontSize:11}}>この見積は受注登録済みです ({fmtDate(q.convertedAt)} / {q.convertedBy})</div>}
+        {q.convertedTransactionId && data.transactions.find(t=>t.id===q.convertedTransactionId)?.status==="cancelled" &&
+          <div style={{background:"#F8D7DA",color:"#DC3545",padding:8,borderRadius:4,marginBottom:8,fontSize:11,fontWeight:"bold"}}>⚠ この見積から登録された受注は取消済みです【受注取消済】</div>}
 
         <div className="flex" style={{justifyContent:"space-between",marginTop:12}}>
           <div>
