@@ -8570,6 +8570,9 @@ function QuotationsTab({data,update}){
             const c = data.partners.find(p=>p.id===q.customerId);
             const totals = computeQuotationTotals(q, data.products);
             const linkedTx = q.convertedTransactionId ? data.transactions.find(t=>t.id===q.convertedTransactionId) : null;
+            // 連携先の取引が「取消」ステータスの場合だけでなく、取引自体が削除されて存在しなくなった場合も
+            // 見積側から見れば受注が取り消された状態なので、あわせて「受注取消済」とみなす
+            const orderCancelled = !!q.convertedTransactionId && (linkedTx ? linkedTx.status==="cancelled" : true);
             return <tr key={q.id}>
               <td>{q.quotationNo}</td>
               <td>{fmtDate(q.quotationDate)}</td>
@@ -8578,7 +8581,7 @@ function QuotationsTab({data,update}){
               <td className="text-right price">{yen(totals.taxIncludedTotal)}</td>
               <td>
                 <span className={"badge "+(q.status==="ordered"?"badge-invoiced":q.status==="draft"?"badge-created":"badge-hiryou")}>{QUOTATION_STATUS_LABEL[q.status]||q.status}</span>
-                {linkedTx?.status==="cancelled" && <span className="badge badge-cancelled" style={{marginLeft:4}}>受注取消済</span>}
+                {orderCancelled && <span className="badge badge-cancelled" style={{marginLeft:4}}>受注取消済</span>}
               </td>
               <td>
                 <button className="btn btn-secondary btn-sm" onClick={()=>setEditing(q)}>{q.status==="ordered"?"表示":"編集"}</button>
@@ -8747,8 +8750,12 @@ function QuotationModal({record,data,update,onSave,onClose}){
         <div className="form-row"><label>社内メモ</label><input value={q.internalMemo||""} onChange={e=>set("internalMemo",e.target.value)}/></div>
 
         {q.convertedTransactionId && <div style={{background:"#DEEBF7",color:"#1565C0",padding:8,borderRadius:4,marginBottom:8,fontSize:11}}>この見積は受注登録済みです ({fmtDate(q.convertedAt)} / {q.convertedBy})</div>}
-        {q.convertedTransactionId && data.transactions.find(t=>t.id===q.convertedTransactionId)?.status==="cancelled" &&
-          <div style={{background:"#F8D7DA",color:"#DC3545",padding:8,borderRadius:4,marginBottom:8,fontSize:11,fontWeight:"bold"}}>⚠ この見積から登録された受注は取消済みです【受注取消済】</div>}
+        {(() => {
+          const linkedTx = q.convertedTransactionId ? data.transactions.find(t=>t.id===q.convertedTransactionId) : null;
+          const orderCancelled = !!q.convertedTransactionId && (linkedTx ? linkedTx.status==="cancelled" : true);
+          return orderCancelled &&
+            <div style={{background:"#F8D7DA",color:"#DC3545",padding:8,borderRadius:4,marginBottom:8,fontSize:11,fontWeight:"bold"}}>⚠ この見積から登録された受注は取消済みです【受注取消済】</div>;
+        })()}
 
         <div className="flex" style={{justifyContent:"space-between",marginTop:12}}>
           <div>
