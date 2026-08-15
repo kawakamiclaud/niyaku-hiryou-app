@@ -8516,6 +8516,18 @@ function QuotationsTab({data,update}){
     setEditing(null);
   };
 
+  // 既存の見積と同じ内容(品目等)で、新規の下書き見積を作る(例: 熊本向けと同じ内容で広島向けも作りたい、等)。
+  // idを持たせずにeditingへ渡すことで、保存時は既存のsave()の「新規作成」経路(id採番・見積No発行)がそのまま使われる。
+  const duplicate = (q) => {
+    const {id, quotationNo, createdAt, updatedAt, createdBy, updatedBy, convertedTransactionId, convertedAt, convertedBy, ...rest} = q;
+    setEditing({
+      ...rest,
+      quotationDate: today(),
+      status: "draft",
+      items: (q.items||[]).map(it => ({...it, id:newId("qit"), partiallyConvertedQty:0})),
+    });
+  };
+
   const del = (id) => {
     const q = (data.quotations||[]).find(x=>x.id===id);
     if (!q) return;
@@ -8586,6 +8598,7 @@ function QuotationsTab({data,update}){
               <td>
                 <button className="btn btn-secondary btn-sm" onClick={()=>setEditing(q)}>{q.status==="ordered"?"表示":"編集"}</button>
                 <button className="btn btn-secondary btn-sm" style={{marginLeft:4}} onClick={()=>handlePrint(q)}>印刷/PDF</button>
+                <button className="btn btn-secondary btn-sm" style={{marginLeft:4}} onClick={()=>duplicate(q)}>複製する</button>
                 {!q.convertedTransactionId && <button className="btn btn-danger btn-sm" style={{marginLeft:4}} onClick={()=>del(q.id)}>削除</button>}
               </td>
             </tr>;
