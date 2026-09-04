@@ -115,11 +115,15 @@ const INITIAL_DATA = {
   "transactions": []
 };
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
+
+// 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
+// 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
+const BUILD_LABEL = "2026-09-04 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
-// 連続して適用できるよう、fromVersion<2 / fromVersion<3 / fromVersion<4 / fromVersion<5 / fromVersion<6 / fromVersion<7 / fromVersion<8 の各ブロックを全て保持する。
+// 連続して適用できるよう、fromVersion<2 / fromVersion<3 / fromVersion<4 / fromVersion<5 / fromVersion<6 / fromVersion<7 / fromVersion<8 / fromVersion<9 の各ブロックを全て保持する。
 function migrateData(raw) {
   if (!raw) return raw;
   let d = {...raw};
@@ -275,6 +279,28 @@ function migrateData(raw) {
     d.meta.migratedAtV8 = new Date().toISOString();
   } else {
     d.payments = d.payments || [];
+  }
+  // ---- v9マイグレーション: 見積の「明細ごとの受注登録」に対応 ----
+  // これまでは1見積につき1取引(convertedTransactionId)しか紐づけられず、
+  // 一度受注登録すると残りの明細を後から受注登録できなかった。
+  // 複数回の受注登録に対応するため、紐づく取引IDを配列(convertedTransactionIds)で保持する。
+  // 既存のconvertedTransactionIdは「最初に登録した取引」として今後も残す(帳票・既存参照との互換のため)。
+  if (fromVersion < 9) {
+    d.quotations = (d.quotations || []).map(q => ({
+      ...q,
+      convertedTransactionIds: Array.isArray(q.convertedTransactionIds)
+        ? q.convertedTransactionIds
+        : (q.convertedTransactionId ? [q.convertedTransactionId] : []),
+      items: (q.items || []).map(it => ({...it, partiallyConvertedQty: Number(it.partiallyConvertedQty || 0)})),
+    }));
+    d.meta.migratedAtV9 = new Date().toISOString();
+  } else {
+    d.quotations = (d.quotations || []).map(q => ({
+      ...q,
+      convertedTransactionIds: Array.isArray(q.convertedTransactionIds)
+        ? q.convertedTransactionIds
+        : (q.convertedTransactionId ? [q.convertedTransactionId] : []),
+    }));
   }
   d.meta.schemaVersion = SCHEMA_VERSION;
   return d;
@@ -523,6 +549,22 @@ function itemSummary(items, products) {
   const names = items.map(it => {
     const p = products.find(x => x.id === it.productId);
     return p ? p.name : "?";
+  });
+  if (names.length <= 2) return names.join("、");
+  return names.slice(0,2).join("、") + " 他" + (names.length-2) + "品";
+}
+
+// 取引一覧の「品目」列用。itemSummaryと同じ形式だが、品目名の右に受注数量(単位付き)も出す。
+// 見積一覧など他の画面の表示は変えたくないので、既存のitemSummaryはそのまま残して別関数にしている。
+function itemSummaryWithQty(items, products) {
+  if (!items || items.length === 0) return "-";
+  const names = items.map(it => {
+    const p = products.find(x => x.id === it.productId);
+    const name = p ? p.name : "?";
+    const qty = Number(it.qty || 0);
+    const unit = it.unit || (p ? p.unit : "") || "";
+    const qtyStr = Number.isInteger(qty) ? String(qty) : String(Number(qty.toFixed(2)));
+    return name + " " + qtyStr + unit;
   });
   if (names.length <= 2) return names.join("、");
   return names.slice(0,2).join("、") + " 他" + (names.length-2) + "品";
@@ -937,6 +979,44 @@ function buildPurchaseOrderSnapshot(tx, supplierId, data, documentNo) {
   };
 }
 
+// ---- 請求書スナップショット構築。発行済invoiceレコードに凍結された明細(billedQty/unitPrice/amount/taxRate)
+// をそのまま使う。取引側を後から編集しても、発行済の請求書の内容は変わらない。 ----
+function buildInvoiceSnapshot(invoice, data) {
+  const customer = data.partners.find(p=>p.id===invoice.customerId);
+  const issueDate = invoiceIssueDate(invoice) || (invoice.issuedAt||"").slice(0,10);
+  const items = (invoice.items||[]).map(li => {
+    const pd = data.products.find(x=>x.id===li.productId);
+    const tx = (data.transactions||[]).find(t=>t.id===li.transactionId);
+    const txItem = tx ? (tx.items||[]).find(x=>x.id===li.transactionItemId) : null;
+    return {
+      transactionNo: tx?.transactionNo || "",
+      transactionDate: tx?.transactionDate || "",
+      sanchi: tx?.sanchi || "",
+      productName: pd?.name || "?",
+      unit: txItem?.unit || pd?.unit || "",
+      qty: Number(li.billedQty)||0,
+      unitPrice: Number(li.unitPrice)||0,
+      taxRate: Number(li.taxRate)===0.08 ? 0.08 : 0.10,
+      amount: Number(li.amount)||0,
+    };
+  }).sort((a,b)=>(a.transactionDate||"").localeCompare(b.transactionDate||""));
+  return {
+    company: buildCompanySnapshot(data),
+    customer: buildPartnerSnapshot(customer),
+    invoiceNo: invoice.invoiceNo,
+    targetMonth: invoice.targetMonth || "",
+    issueDate,
+    dueDate: calcDueDate(customer, issueDate),
+    issuedAt: invoice.issuedAt || "",
+    reissued: invoice.status === "reissued",
+    freeeInvoiceId: invoice.freeeInvoiceId || null,
+    items,
+    subtotalByTaxRate: invoice.subtotalByTaxRate || {"0.08":0,"0.10":0},
+    taxByTaxRate: invoice.taxByTaxRate || {"0.08":0,"0.10":0},
+    total: Number(invoice.total)||0,
+  };
+}
+
 // ---- 納品書スナップショット構築。取引の受注数量ではなく、対象shipmentレコードの各明細deliveredQty
 // (=分納ならその回に実際に納品した数量)だけを使う。単価は元取引明細の受注単価(凍結)を引用する。 ----
 function buildDeliveryNoteSnapshot(shipment, tx, data) {
@@ -995,6 +1075,47 @@ function prepareDocument(data, {documentType, sourceId, documentNo, buildSnapsho
   };
   return {doc, isNew:true};
 }
+// ---- Googleドライブ保存用: 帳票種別の日本語名 ----
+const DOCUMENT_TYPE_LABELS = {quotation:"見積書", purchase_order:"発注書", delivery_note:"納品書", invoice:"請求書"};
+
+// ---- 保存先フォルダ。「肥料農薬の書類だと一目で分かること」が要件のため、
+// 親フォルダ・種別フォルダの両方に「肥料農薬」を必ず含める。
+// 例: 川上荷役_肥料農薬 / 肥料農薬_請求書 / 2026-09 ----
+function driveFolderPathFor(doc) {
+  const s = doc.snapshot || {};
+  const typeName = DOCUMENT_TYPE_LABELS[doc.documentType] || "帳票";
+  const ym = (s.targetMonth
+    || (s.issueDate || s.quotationDate || s.purchaseOrderDate || s.deliveryDate || doc.issuedAt || "").slice(0,7));
+  const base = "川上荷役_肥料農薬/肥料農薬_" + typeName;
+  return ym ? (base + "/" + ym) : base;
+}
+
+// ---- ファイル名。Googleドライブで使えない文字と空白を除去する ----
+function driveFileNameFor(doc) {
+  const s = doc.snapshot || {};
+  const typeName = DOCUMENT_TYPE_LABELS[doc.documentType] || "帳票";
+  const who = s.customer?.name || s.supplier?.name || "";
+  const when = s.targetMonth || (s.issueDate || s.quotationDate || s.purchaseOrderDate || s.deliveryDate || "").slice(0,10);
+  const parts = ["肥料農薬", typeName, doc.documentNo || "", who, when].filter(Boolean);
+  return parts.join("_").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, "") + ".pdf";
+}
+
+// ---- 印刷画面のDOMを、単体で開けるHTMLに包む(GAS側でPDFへ変換する材料)。
+// GASのHTML→PDF変換はflex/gridを解釈しないため、崩れないよう最低限のCSSを同梱する。 ----
+function buildPrintableHtml(title, innerHtml) {
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + title + '</title><style>'
+    + 'body{font-family:"Noto Sans JP","Yu Gothic","Meiryo",sans-serif;font-size:12px;color:#222;margin:18mm 15mm;}'
+    + 'h2{text-align:center;font-size:20px;margin:0 0 16px;}'
+    + 'table{width:100%;border-collapse:collapse;margin-top:6px;}'
+    + 'th,td{border:1px solid #999;padding:4px 6px;font-size:11px;}'
+    + 'th{background:#EEE;}'
+    + '.text-right{text-align:right;}.text-center{text-align:center;}'
+    + '.price{font-weight:bold;}'
+    + '.grid-2>div:last-child{text-align:right;}'
+    + 'img{max-width:140px;max-height:80px;}'
+    + '</style></head><body>' + innerHtml + '</body></html>';
+}
+
 // ---- 新規発行の帳票をdata.documentsへ確定登録し、監査ログに記録する ----
 function commitDocumentIssue(d, doc, reason) {
   d.documents = [...(d.documents||[]), doc];
@@ -1215,7 +1336,9 @@ function App(){
 
   return (<>
     <header className="no-print">
-      <h1>{data.meta?.app || "川上荷役 肥料農薬 v2"}</h1>
+      <h1>{data.meta?.app || "川上荷役 肥料農薬 v2"}
+        <span style={{fontSize:11,fontWeight:"normal",opacity:0.75,marginLeft:8}}>{BUILD_LABEL}</span>
+      </h1>
       <div className="actions">
         {syncStatus==="connected" && <span className="badge-sync">● 自動保存中</span>}
         {backendConfig.enabled && <span className="badge-backend" title={lastSyncTime?`最終同期: ${lastSyncTime.toLocaleString('ja-JP')}`:""}>● 共有DB同期中</span>}
@@ -1554,7 +1677,7 @@ function TransactionsTab({data,update}){
               <td>{c?.name||"-"}</td>
               <td>{s?.name||"-"}</td>
               <td>{t.sanchi}</td>
-              <td style={{fontSize:11}}>{itemSummary(t.items, data.products)}</td>
+              <td style={{fontSize:11}}>{itemSummaryWithQty(t.items, data.products)}</td>
               <td>{t.plannedDeliveryDate?fmtDate(t.plannedDeliveryDate):"-"}</td>
               <td className="text-right price">{yen(t.totalSaleAmount)}</td>
               <td className="text-right price">{yen(t.totalPurchaseAmount)}</td>
@@ -2377,6 +2500,8 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
   const [cancelling,setCancelling] = useState(false); // 二重クリック防止(請求取消)
   const [freeeConfirmTarget,setFreeeConfirmTarget] = useState(null); // freee側手動取消の確認対象invoice
   const [confirming,setConfirming] = useState(false); // 二重クリック防止(freee側取消確認)
+  const [printDoc,setPrintDoc] = useState(null);   // 請求書PDFの表示対象
+  const [printIsNew,setPrintIsNew] = useState(false); // 今回はじめて発行した帳票か(=ドライブへ自動保存する)
 
   // freee側手動取消待ちの請求(全期間対象。月フィルタに関係なく常に見えるようにする)
   const pendingManualInvoices = (data.invoices||[]).filter(i=>i.freeeCancelStatus==="pending_manual");
@@ -2566,6 +2691,19 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
     }
   };
 
+  // ---- 請求書PDFの発行。見積書・発注書・納品書と同じ「発行したら内容を凍結する」仕組みを使う。
+  // 既に発行済(未取消)の請求書帳票があれば、その凍結済みの内容をそのまま開き直す。
+  // 新規発行のときだけ、Googleドライブへ自動保存する(DocumentPrintViewのautoDrive)。 ----
+  const handleInvoicePrint = (inv) => {
+    const {doc, isNew} = prepareDocument(data, {
+      documentType:"invoice", sourceId: inv.id, documentNo: inv.invoiceNo,
+      buildSnapshot: () => buildInvoiceSnapshot(inv, data),
+    });
+    if (isNew) update(d => commitDocumentIssue(d, doc, `請求書${inv.invoiceNo}`));
+    setPrintIsNew(isNew);
+    setPrintDoc(doc);
+  };
+
   const cancelInvoice = (invoice, reason) => {
     if (cancelling) return; // 連打によるレースコンディション(取消の二重記録)防止
     // freeeへ送信済みの請求の場合、アプリ内取消だけではfreee側の請求書は残ったままになる旨を
@@ -2740,23 +2878,35 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
     <div className="card">
       <h2>この月の発行済請求書</h2>
       {monthInvoices.length===0 && <p style={{color:"#999",padding:10}}>この月の発行済請求書はありません</p>}
+      <p style={{fontSize:11,color:"#666",marginBottom:8}}>💡「請求書PDF発行」を押すと請求書を表示します。共有データベース(GAS)が設定されていれば、初回発行時に <strong>Googleドライブの「川上荷役_肥料農薬 ＞ 肥料農薬_請求書 ＞ 対象月」フォルダへPDFを自動保存</strong>します。2回目以降は同じ内容を開き直すだけで、必要なら画面上のボタンから手動で保存し直せます。</p>
       <table>
-        <thead><tr><th>請求No.</th><th>お客様</th><th className="text-right">税込合計</th><th>状態</th><th>発行日時</th><th></th></tr></thead>
+        <thead><tr><th>請求No.</th><th>お客様</th><th className="text-right">税込合計</th><th>状態</th><th>発行日時</th><th>ドライブ保存</th><th></th></tr></thead>
         <tbody>
           {monthInvoices.map(inv=>{
             const c = data.partners.find(p=>p.id===inv.customerId);
+            const savedDoc = (data.documents||[]).find(x=>x.documentType==="invoice" && x.sourceId===inv.id && !x.cancelled);
             return <tr key={inv.id}>
               <td>{inv.invoiceNo}</td>
               <td>{c?.name||"-"}</td>
               <td className="text-right price">{yen(inv.total)}</td>
               <td><span className="badge badge-invoiced">{inv.status==="reissued"?"再発行":"発行済"}</span></td>
               <td>{inv.issuedAt ? new Date(inv.issuedAt).toLocaleString('ja-JP') : "-"}</td>
-              <td><button className="btn btn-danger btn-sm" onClick={()=>setCancelTarget(inv)}>取消</button></td>
+              <td style={{fontSize:11}}>
+                {savedDoc?.driveFileUrl
+                  ? <a href={savedDoc.driveFileUrl} target="_blank" rel="noreferrer">保存済み(開く)</a>
+                  : <span style={{color:"#999"}}>未保存</span>}
+              </td>
+              <td>
+                <button className="btn btn-primary btn-sm" onClick={()=>handleInvoicePrint(inv)}>請求書PDF発行</button>
+                <button className="btn btn-danger btn-sm" style={{marginLeft:4}} onClick={()=>setCancelTarget(inv)}>取消</button>
+              </td>
             </tr>;
           })}
         </tbody>
       </table>
     </div>
+
+    {printDoc && <DocumentPrintView doc={printDoc} update={update} autoDrive={printIsNew} onClose={()=>{setPrintDoc(null); setPrintIsNew(false);}}/>}
 
     {preview && (
       <div className="modal-bg" onClick={()=>!sending && setPreview(null)}>
@@ -4216,6 +4366,7 @@ function PricesTab({data,update}){
   const [filterPart,setFilterPart] = useState("");
   const [filterProd,setFilterProd] = useState("");
   const [editing,setEditing] = useState(null);
+  const [pairing,setPairing] = useState(null); // 仕入・販売まとめて登録モーダルの入力内容
   let list = data.prices || [];
   if (filterPart) list = list.filter(p=>p.partnerId===filterPart);
   if (filterProd) list = list.filter(p=>p.productId===filterProd);
@@ -4243,6 +4394,47 @@ function PricesTab({data,update}){
     });
     setEditing(null);
   };
+  // ---- 仕入・販売の単価を1回の操作でまとめて登録する。
+  // 商品・産地・適用期間・税率は共通で、仕入先＋仕入単価／販売先＋販売単価をそれぞれ入力する。
+  // 保存すると単価マスタには従来どおり「仕入」「販売」の2行が独立して作られる(データ構造は変えない)。
+  // 片方だけの入力でも保存できる。
+  const savePair = (f) => {
+    const errors = [];
+    if (!f.productId) errors.push("商品は必須です");
+    if (!f.startDate) errors.push("適用開始日は必須です");
+    const wantPurchase = !!f.supplierId;
+    const wantSale = !!f.customerId;
+    if (!wantPurchase && !wantSale) errors.push("仕入先・販売先のどちらか(または両方)を選択してください");
+    if (wantPurchase && Number(f.purchasePrice) < 0) errors.push("仕入単価にマイナスは入力できません");
+    if (wantSale && Number(f.salePrice) < 0) errors.push("販売単価にマイナスは入力できません");
+    const base = {
+      productId: f.productId, sanchi: f.sanchi||"熊本", taxRate: Number(f.taxRate)||0.1,
+      startDate: f.startDate, endDate: f.endDate||"", note: f.note||"",
+    };
+    const rows = [];
+    if (wantPurchase) rows.push({...base, partnerId:f.supplierId, priceType:"purchase", unitPrice:Number(f.purchasePrice)||0});
+    if (wantSale) rows.push({...base, partnerId:f.customerId, priceType:"sale", unitPrice:Number(f.salePrice)||0});
+    // 既存の単価と適用期間が重複していないかは、1行ずつ登録するときと全く同じ判定を使う
+    rows.forEach(r=>{
+      const overlap = findOverlappingPrice(data.prices||[], r);
+      if (overlap) {
+        const pt = data.partners.find(x=>x.id===r.partnerId);
+        const pd = data.products.find(x=>x.id===r.productId);
+        errors.push("同一条件(" + (pt?.name||"") + "/" + (pd?.name||"") + "/" + r.sanchi + "/" + (r.priceType==="sale"?"販売":"仕入") + ")で適用期間が重複する単価が既に存在します(" + fmtDate(overlap.startDate) + "〜" + (overlap.endDate?fmtDate(overlap.endDate):"無期限") + ")");
+      }
+    });
+    if (errors.length) { alert("入力エラー:\n・"+errors.join("\n・")); return; }
+    update(d=>{
+      d.prices = d.prices||[];
+      for (const r of rows) {
+        r.id = newId("price");
+        d.prices.push(r);
+        d = addAuditLog(d, {action:"create", targetType:"price", targetId:r.id, before:null, after:r});
+      }
+      return d;
+    });
+    setPairing(null);
+  };
   const del = id => {
     // 単価は取引にIDで直接紐づかない(値をコピーして使う)ため常に物理削除可
     if(!confirm("削除?"))return;
@@ -4257,7 +4449,10 @@ function PricesTab({data,update}){
     <div className="card">
       <div className="flex-between" style={{marginBottom:12}}>
         <h2 style={{border:"none",padding:0}}>単価マスタ ({list.length}行) 期間別価格</h2>
-        <button className="btn btn-primary" onClick={()=>setEditing({partnerId:"",productId:"",sanchi:"熊本",priceType:"sale",unitPrice:0,taxRate:0.1,startDate:today(),endDate:""})}>＋ 新規</button>
+        <div className="flex">
+          <button className="btn btn-success" onClick={()=>setPairing({productId:"",sanchi:"熊本",taxRate:0.1,startDate:today(),endDate:"",note:"",supplierId:"",purchasePrice:0,customerId:"",salePrice:0})}>＋ 仕入・販売をまとめて登録</button>
+          <button className="btn btn-primary" onClick={()=>setEditing({partnerId:"",productId:"",sanchi:"熊本",priceType:"sale",unitPrice:0,taxRate:0.1,startDate:today(),endDate:""})}>＋ 新規(1行ずつ)</button>
+        </div>
       </div>
       <div className="flex" style={{marginBottom:12}}>
         <select value={filterPart} onChange={e=>setFilterPart(e.target.value)}>
@@ -4290,6 +4485,106 @@ function PricesTab({data,update}){
       </table>
       {list.length > 300 && <p style={{marginTop:8,color:"#999"}}>...他{list.length-300}行 (フィルタで絞ってください)</p>}
       {editing && <PriceModal price={editing} data={data} onSave={save} onClose={()=>setEditing(null)}/>}
+      {pairing && <PricePairModal form={pairing} data={data} onSave={savePair} onClose={()=>setPairing(null)}/>}
+    </div>
+  );
+}
+
+// ---- 仕入・販売の単価をまとめて登録するモーダル。
+// 商品/産地/適用期間/税率は共通、仕入と販売はそれぞれ取引先と単価を持つ。粗利はその場で計算して見せる。
+function PricePairModal({form,data,onSave,onClose}){
+  const [f,setF] = useState(form);
+  const set = (k,v) => setF({...f,[k]:v});
+  const suppliers = data.partners.filter(p=>p.type==="supplier"||p.type==="both");
+  const customers = data.partners.filter(p=>p.type==="customer"||p.type==="both");
+  const product = data.products.find(x=>x.id===f.productId);
+
+  // 商品・産地・取引先が決まったら、現在有効な単価を初期値として引っ張ってくる(入力の手間を減らす)。
+  // 既に単価が入力されている場合は上書きしない。
+  const prefill = (next) => {
+    const n = {...next};
+    if (n.productId && n.supplierId && !Number(n.purchasePrice)) {
+      const pp = findPrice(data.prices, n.supplierId, n.productId, n.sanchi, n.startDate||today(), "purchase");
+      if (pp) n.purchasePrice = pp.unitPrice;
+    }
+    if (n.productId && n.customerId && !Number(n.salePrice)) {
+      const sp = findPrice(data.prices, n.customerId, n.productId, n.sanchi, n.startDate||today(), "sale");
+      if (sp) n.salePrice = sp.unitPrice;
+    }
+    return n;
+  };
+  const setAndPrefill = (k,v) => setF(prefill({...f,[k]:v}));
+
+  const purchase = Number(f.purchasePrice)||0;
+  const sale = Number(f.salePrice)||0;
+  const gp = sale - purchase;
+  const gpRate = sale > 0 ? (gp/sale*100) : 0;
+  const bothFilled = !!f.supplierId && !!f.customerId;
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" style={{width:760}} onClick={e=>e.stopPropagation()}>
+        <h3>単価の一括登録（仕入・販売を同時に入力）</h3>
+        <p style={{fontSize:11,color:"#666",marginBottom:10}}>💡 商品・産地・適用期間・税率は共通です。仕入先と販売先はそれぞれ別の取引先を選べます。保存すると単価マスタには「仕入」「販売」の2行が作られます（片方だけの入力でも保存できます）。</p>
+        <div className="grid-4">
+          <div className="form-row" style={{gridColumn:"span 2"}}><label>商品 *</label>
+            <select value={f.productId||""} onChange={e=>setAndPrefill("productId",e.target.value)}>
+              <option value="">選択...</option>
+              {data.products.filter(p=>p.active!==false).map(pd=><option key={pd.id} value={pd.id}>{pd.name}</option>)}
+            </select>
+          </div>
+          <div className="form-row"><label>産地</label>
+            <select value={f.sanchi||"熊本"} onChange={e=>setAndPrefill("sanchi",e.target.value)}><option>熊本</option><option>広島</option></select>
+          </div>
+          <div className="form-row"><label>税率(共通)</label>
+            <select value={f.taxRate||0.1} onChange={e=>set("taxRate",Number(e.target.value))}>
+              <option value="0.08">8% 軽減</option><option value="0.1">10% 標準</option>
+            </select>
+          </div>
+        </div>
+        <div className="grid-4">
+          <div className="form-row"><label>適用開始日 *</label><input type="date" value={f.startDate||""} onChange={e=>set("startDate",e.target.value)}/></div>
+          <div className="form-row"><label>適用終了日(空欄=無期限)</label><input type="date" value={f.endDate||""} onChange={e=>set("endDate",e.target.value)}/></div>
+          <div className="form-row" style={{gridColumn:"span 2"}}><label>備考(共通)</label><input value={f.note||""} onChange={e=>set("note",e.target.value)}/></div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:10}}>
+          <div style={{border:"1px solid #DDE6F0",borderRadius:6,padding:10,background:"#FFF7E6"}}>
+            <strong style={{fontSize:12,color:"#B45309"}}>仕入（メーカー等から買う）</strong>
+            <div className="form-row" style={{marginTop:6}}><label>仕入先</label>
+              <select value={f.supplierId||""} onChange={e=>setAndPrefill("supplierId",e.target.value)}>
+                <option value="">(登録しない)</option>
+                {suppliers.map(pt=><option key={pt.id} value={pt.id}>{pt.name}</option>)}
+              </select>
+            </div>
+            <div className="form-row"><label>仕入単価(税抜)</label><input type="number" value={f.purchasePrice||0} onChange={e=>set("purchasePrice",Number(e.target.value))}/></div>
+          </div>
+          <div style={{border:"1px solid #DDE6F0",borderRadius:6,padding:10,background:"#E8F1FB"}}>
+            <strong style={{fontSize:12,color:"#1565C0"}}>販売（お客様へ売る）</strong>
+            <div className="form-row" style={{marginTop:6}}><label>販売先</label>
+              <select value={f.customerId||""} onChange={e=>setAndPrefill("customerId",e.target.value)}>
+                <option value="">(登録しない)</option>
+                {customers.map(pt=><option key={pt.id} value={pt.id}>{pt.name}</option>)}
+              </select>
+            </div>
+            <div className="form-row"><label>販売単価(税抜)</label><input type="number" value={f.salePrice||0} onChange={e=>set("salePrice",Number(e.target.value))}/></div>
+          </div>
+        </div>
+
+        {bothFilled && (
+          <div className="summary-box" style={{gridTemplateColumns:"repeat(4,1fr)",marginTop:10}}>
+            <div className="item"><div className="lbl">商品</div><div className="val" style={{fontSize:12}}>{product?.name||"-"}</div></div>
+            <div className="item"><div className="lbl">仕入単価</div><div className="val">{yen(purchase)}</div></div>
+            <div className="item"><div className="lbl">販売単価</div><div className="val">{yen(sale)}</div></div>
+            <div className="item"><div className="lbl">粗利(1{product?.unit||"単位"}あたり)</div><div className="val" style={{color:gp>=0?"#2E7D32":"#DC3545"}}>{yen(gp)}（{gpRate.toFixed(1)}%）</div></div>
+          </div>
+        )}
+
+        <div className="flex" style={{justifyContent:"flex-end",marginTop:12}}>
+          <button className="btn btn-secondary" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={()=>onSave(f)}>この内容で登録</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -4347,6 +4642,38 @@ const QUOTATION_STATUS_LABEL = {
   draft:"下書き", submitted:"提出済み", approved:"承認", ordered:"受注",
   lost:"失注", expired:"期限切れ", cancelled:"取消"
 };
+
+// 見積の受注登録の進み具合を求める。品目数ベース(何品目を受注登録し終えたか)と
+// 数量ベース(合計何個のうち何個を受注登録したか)の両方を返す。
+function quotationOrderProgress(q) {
+  const items = q.items || [];
+  let doneItems = 0, partialItems = 0, totalQty = 0, orderedQty = 0;
+  items.forEach(it => {
+    const qty = Number(it.qty||0);
+    const conv = Math.min(Number(it.partiallyConvertedQty||0), qty);
+    totalQty += qty; orderedQty += conv;
+    if (qty > 0 && conv >= qty) doneItems++;
+    else if (conv > 0) partialItems++;
+  });
+  const totalItems = items.length;
+  const state = totalItems === 0 ? "none"
+    : (doneItems === totalItems ? "done"
+    : ((doneItems + partialItems) > 0 ? "partial" : "not"));
+  return {totalItems, doneItems, partialItems, totalQty, orderedQty, state};
+}
+
+// 見積に紐づく取引(受注)が全て取消されている(または削除されている)かを判定する。
+// 明細ごとの受注登録に対応したため、紐づく取引は複数になり得る。
+function quotationOrderCancelled(q, data) {
+  const ids = (q.convertedTransactionIds && q.convertedTransactionIds.length)
+    ? q.convertedTransactionIds
+    : (q.convertedTransactionId ? [q.convertedTransactionId] : []);
+  if (ids.length === 0) return false;
+  return ids.every(id => {
+    const t = (data.transactions||[]).find(x=>x.id===id);
+    return !t || t.status === "cancelled";
+  });
+}
 
 function QuotationsTab({data,update}){
   const [editing,setEditing] = useState(null);
@@ -4452,16 +4779,16 @@ function QuotationsTab({data,update}){
       <table>
         <thead><tr>
           <th>見積No.</th><th>見積日</th><th>販売先</th><th>品目</th>
-          <th className="text-right">税込合計</th><th>状態</th><th></th>
+          <th className="text-right">税込合計</th><th>状態</th><th>受注状況</th><th></th>
         </tr></thead>
         <tbody>
           {list.map(q=>{
             const c = data.partners.find(p=>p.id===q.customerId);
             const totals = computeQuotationTotals(q, data.products);
-            const linkedTx = q.convertedTransactionId ? data.transactions.find(t=>t.id===q.convertedTransactionId) : null;
             // 連携先の取引が「取消」ステータスの場合だけでなく、取引自体が削除されて存在しなくなった場合も
             // 見積側から見れば受注が取り消された状態なので、あわせて「受注取消済」とみなす
-            const orderCancelled = !!q.convertedTransactionId && (linkedTx ? linkedTx.status==="cancelled" : true);
+            const orderCancelled = quotationOrderCancelled(q, data);
+            const prog = quotationOrderProgress(q);
             return <tr key={q.id}>
               <td>{q.quotationNo}</td>
               <td>{fmtDate(q.quotationDate)}</td>
@@ -4471,6 +4798,12 @@ function QuotationsTab({data,update}){
               <td>
                 <span className={"badge "+(q.status==="ordered"?"badge-invoiced":q.status==="draft"?"badge-created":"badge-hiryou")}>{QUOTATION_STATUS_LABEL[q.status]||q.status}</span>
                 {orderCancelled && <span className="badge badge-cancelled" style={{marginLeft:4}}>受注取消済</span>}
+              </td>
+              <td style={{fontSize:11}}>
+                {prog.state==="done" && <span className="badge badge-invoiced">受注済 (全{prog.totalItems}品)</span>}
+                {prog.state==="partial" && <span className="badge badge-created">一部受注済 {prog.doneItems}/{prog.totalItems}品</span>}
+                {prog.state==="not" && <span style={{color:"#999"}}>未登録</span>}
+                {prog.state==="none" && <span style={{color:"#999"}}>-</span>}
               </td>
               <td>
                 <button className="btn btn-secondary btn-sm" onClick={()=>setEditing(q)}>{q.status==="ordered"?"表示":"編集"}</button>
@@ -4494,7 +4827,10 @@ function QuotationModal({record,data,update,onSave,onClose}){
   const set = (k,v) => setQ({...q,[k]:v});
   const customers = data.partners.filter(p=>p.type==="customer");
   const isConverted = !!q.convertedTransactionId || q.status==="ordered";
-  const canConvert = !!q.id && !q.convertedTransactionId && ["draft","submitted","approved"].includes(q.status);
+  const prog = quotationOrderProgress(q);
+  // 明細ごとの受注登録に対応したため、一部だけ登録した見積は「残りの品目」を後から受注登録できる。
+  // 全品目を登録し終えた見積(status==="ordered")だけボタンを出さない。
+  const canConvert = !!q.id && prog.totalItems > 0 && prog.state !== "done" && ["draft","submitted","approved"].includes(q.status);
 
   const addItem = () => {
     const items = [...(q.items||[]), {id:newId("qit"), productId:"", productCode:"", qty:0, unit:"", salePrice:0, taxRate:0.1, discountAmount:0, amount:0, note:""}];
@@ -4601,13 +4937,13 @@ function QuotationModal({record,data,update,onSave,onClose}){
               <button className="btn btn-secondary btn-sm" onClick={addItem}>＋ 品目追加</button>
             </div>
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"1.6fr 55px 45px 90px 90px 90px 90px 30px",gap:4,padding:"6px",fontSize:10,color:"#888",fontWeight:"bold"}}>
+          <div style={{display:"grid",gridTemplateColumns:"1.6fr 55px 45px 90px 90px 90px 90px 84px 30px",gap:4,padding:"6px",fontSize:10,color:"#888",fontWeight:"bold"}}>
             <div>商品</div><div className="text-center">数量</div><div className="text-center">単位</div>
             <div className="text-center">販売単価</div><div className="text-center">税率</div>
-            <div className="text-center">値引</div><div className="text-center">金額</div><div></div>
+            <div className="text-center">値引</div><div className="text-center">金額</div><div className="text-center">受注</div><div></div>
           </div>
           {(q.items||[]).map((it,i)=>(
-            <div className="item-row" key={it.id||i} style={{gridTemplateColumns:"1.6fr 55px 45px 90px 90px 90px 90px 30px"}}>
+            <div className="item-row" key={it.id||i} style={{gridTemplateColumns:"1.6fr 55px 45px 90px 90px 90px 90px 84px 30px"}}>
               <select value={it.productId||""} onChange={e=>updateItem(i,"productId",e.target.value)}>
                 <option value="">商品選択</option>
                 {data.products.filter(p=>p.active).map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
@@ -4620,6 +4956,13 @@ function QuotationModal({record,data,update,onSave,onClose}){
               </select>
               <input type="number" placeholder="値引額" value={it.discountAmount||""} onChange={e=>updateItem(i,"discountAmount",e.target.value)}/>
               <input readOnly value={"¥"+(it.amount||0).toLocaleString()} style={{background:"#DDE6F0",fontWeight:"bold",textAlign:"right"}}/>
+              {(() => {
+                const qty = Number(it.qty||0);
+                const conv = Math.min(Number(it.partiallyConvertedQty||0), qty);
+                if (qty > 0 && conv >= qty) return <span className="badge badge-invoiced" style={{textAlign:"center"}}>受注済</span>;
+                if (conv > 0) return <span className="badge badge-created" style={{textAlign:"center"}}>{conv}/{qty}</span>;
+                return <span style={{fontSize:10,color:"#999",textAlign:"center"}}>未</span>;
+              })()}
               <button className="btn btn-danger btn-sm" onClick={()=>removeItem(i)}>×</button>
             </div>
           ))}
@@ -4639,17 +4982,21 @@ function QuotationModal({record,data,update,onSave,onClose}){
         <div className="form-row" style={{marginTop:10}}><label>備考(先方向け)</label><input value={q.note||""} onChange={e=>set("note",e.target.value)}/></div>
         <div className="form-row"><label>社内メモ</label><input value={q.internalMemo||""} onChange={e=>set("internalMemo",e.target.value)}/></div>
 
-        {q.convertedTransactionId && <div style={{background:"#DEEBF7",color:"#1565C0",padding:8,borderRadius:4,marginBottom:8,fontSize:11}}>この見積は受注登録済みです ({fmtDate(q.convertedAt)} / {q.convertedBy})</div>}
-        {(() => {
-          const linkedTx = q.convertedTransactionId ? data.transactions.find(t=>t.id===q.convertedTransactionId) : null;
-          const orderCancelled = !!q.convertedTransactionId && (linkedTx ? linkedTx.status==="cancelled" : true);
-          return orderCancelled &&
-            <div style={{background:"#F8D7DA",color:"#DC3545",padding:8,borderRadius:4,marginBottom:8,fontSize:11,fontWeight:"bold"}}>⚠ この見積から登録された受注は取消済みです【受注取消済】</div>;
-        })()}
+        {q.convertedTransactionId && (
+          <div style={{background:"#DEEBF7",color:"#1565C0",padding:8,borderRadius:4,marginBottom:8,fontSize:11}}>
+            {prog.state==="done"
+              ? `この見積は全${prog.totalItems}品目とも受注登録済みです`
+              : `この見積は一部だけ受注登録済みです（${prog.doneItems}/${prog.totalItems}品目・数量 ${prog.orderedQty}/${prog.totalQty}）。残りは「残りを受注登録」から個別に登録できます`}
+            （最終登録: {fmtDate(q.convertedAt)} / {q.convertedBy}）
+            {(q.convertedTransactionIds||[]).length > 1 && `／ 受注登録 ${q.convertedTransactionIds.length}回`}
+          </div>
+        )}
+        {quotationOrderCancelled(q, data) &&
+          <div style={{background:"#F8D7DA",color:"#DC3545",padding:8,borderRadius:4,marginBottom:8,fontSize:11,fontWeight:"bold"}}>⚠ この見積から登録された受注は全て取消済みです【受注取消済】</div>}
 
         <div className="flex" style={{justifyContent:"space-between",marginTop:12}}>
           <div>
-            {canConvert && <button className="btn btn-success" onClick={()=>setShowConvert(true)}>この見積から受注登録</button>}
+            {canConvert && <button className="btn btn-success" onClick={()=>setShowConvert(true)}>{prog.state==="partial" ? "残りを受注登録" : "この見積から受注登録"}</button>}
           </div>
           <div className="flex">
             <button className="btn btn-secondary" onClick={onClose}>キャンセル</button>
@@ -4685,6 +5032,10 @@ function QuotationConvertModal({quotation,data,update,onClose}){
       productId: it.productId,
       qty: remaining,
       maxQty: remaining,
+      totalQty: Number(it.qty||0),
+      orderedQty: already,
+      // 既に全数を受注登録済みの品目は最初からチェックを外し、操作もできないようにする
+      selected: remaining > 0,
       unit: it.unit,
       salePrice: it.salePrice, // 販売単価は見積時点のまま引き継ぐ(再取得しない)
       note: it.note,
@@ -4692,6 +5043,9 @@ function QuotationConvertModal({quotation,data,update,onClose}){
       purchasePrice: suggestion ? suggestion.unitPrice : 0,
     };
   }));
+  const selectableCount = convItems.filter(it=>Number(it.maxQty||0) > 0).length;
+  const selectedCount = convItems.filter(it=>it.selected && Number(it.qty) > 0).length;
+  const toggleAll = (on) => setConvItems(convItems.map(it=>Number(it.maxQty||0) > 0 ? {...it, selected:on} : it));
 
   const setConvItem = (i,k,v) => {
     const items = [...convItems];
@@ -4705,19 +5059,38 @@ function QuotationConvertModal({quotation,data,update,onClose}){
 
   const doConvert = () => {
     if (isConverting) return; // 連打によるレースコンディション(取引の二重作成)防止
-    const qtyItems = convItems.filter(it=>Number(it.qty)>0);
-    if (qtyItems.length===0) { alert("転記する数量が0です"); return; }
+    // チェックの入っている品目だけを受注登録する(チェックを外した品目は見積に残り、後から個別に受注登録できる)
+    const qtyItems = convItems.filter(it=>it.selected && Number(it.qty)>0);
+    if (qtyItems.length===0) { alert("受注登録する品目が選択されていません。\n登録したい品目にチェックを入れ、数量を1以上にしてください。"); return; }
+    const over = qtyItems.filter(it=>Number(it.qty) > Number(it.maxQty||0));
+    if (over.length) {
+      const names = over.map(it=>{ const pd = data.products.find(x=>x.id===it.productId); return (pd?.name||it.productId) + "(残 " + it.maxQty + ")"; });
+      alert("受注登録できる残数量を超えています:\n・" + names.join("\n・"));
+      return;
+    }
     setIsConverting(true);
     update(d=>{
       // 二重変換防止: 呼び出し元のstate(quotation)は信用せず、d内の最新状態を再確認してから作成する
       const current = (d.quotations||[]).find(x=>x.id===quotation.id);
       if (!current) { alert("見積が見つかりません"); return d; }
-      if (current.convertedTransactionId || current.status==="ordered") {
-        alert("この見積は既に受注登録済みです(二重登録を防止しました)");
+      if (current.status==="ordered") {
+        alert("この見積は全ての品目が受注登録済みです(二重登録を防止しました)");
+        return d;
+      }
+      // 画面を開いてから他の端末で受注登録された場合に備え、残数量は必ず最新状態(current)から取り直して丸める
+      const fresh = qtyItems.map(ci=>{
+        const src = (current.items||[]).find(x=>x.id===ci.quotationItemId);
+        if (!src) return null;
+        const remain = Math.max(0, Number(src.qty||0) - Number(src.partiallyConvertedQty||0));
+        const q = Math.min(Number(ci.qty||0), remain);
+        return q > 0 ? {...ci, qty:q} : null;
+      }).filter(Boolean);
+      if (fresh.length === 0) {
+        alert("受注登録できる残数量がありません(他の端末で既に受注登録された可能性があります)");
         return d;
       }
       const now = new Date().toISOString();
-      const txItems = qtyItems.map(it=>{
+      const txItems = fresh.map(it=>{
         const saleAmount = Number(it.qty||0)*Number(it.salePrice||0);
         const purchaseAmount = Number(it.qty||0)*Number(it.purchasePrice||0);
         return {
@@ -4752,7 +5125,7 @@ function QuotationConvertModal({quotation,data,update,onClose}){
       // 見積側の各明細に転記済数量を積み上げる。全量転記済みならordered、そうでなければ現状ステータスを維持し、
       // 残数量は今後別途「部分転記」として扱えるようpartiallyConvertedQtyに記録しておく。
       const updatedItems = (current.items||[]).map(it=>{
-        const conv = qtyItems.find(ci=>ci.quotationItemId===it.id);
+        const conv = fresh.find(ci=>ci.quotationItemId===it.id);
         if (!conv) return it;
         const already = Number(it.partiallyConvertedQty||0);
         return {...it, partiallyConvertedQty: already + Number(conv.qty)};
@@ -4760,7 +5133,11 @@ function QuotationConvertModal({quotation,data,update,onClose}){
       const fullyConverted = updatedItems.every(it=>Number(it.partiallyConvertedQty||0) >= Number(it.qty||0));
       const afterQ = {
         ...current, items: updatedItems,
-        convertedTransactionId: txId, convertedAt: now, convertedBy: d.meta?.currentUserName||"",
+        // convertedTransactionIdは「最初に受注登録した取引」を指し続ける(既存の帳票・参照との互換のため)。
+        // 2回目以降の受注登録はconvertedTransactionIdsへ積み増していく。
+        convertedTransactionId: current.convertedTransactionId || txId,
+        convertedTransactionIds: [...(current.convertedTransactionIds||[]), txId],
+        convertedAt: now, convertedBy: d.meta?.currentUserName||"",
         status: fullyConverted ? "ordered" : current.status,
         updatedAt: now, updatedBy: d.meta?.currentUserName||"",
       };
@@ -4778,7 +5155,7 @@ function QuotationConvertModal({quotation,data,update,onClose}){
     <div className="modal-bg" onClick={()=>onClose(false)}>
       <div className="modal" style={{width:900}} onClick={e=>e.stopPropagation()}>
         <h3>見積から受注登録 ({quotation.quotationNo})</h3>
-        <p style={{fontSize:11,color:"#666"}}>💡 販売単価は見積時点の単価をそのまま引き継ぎます。仕入先・仕入単価は現在の単価マスタから改めて検索した候補です。数量は必要に応じて変更できます(一部数量のみの転記も可能)。</p>
+        <p style={{fontSize:11,color:"#666"}}>💡 <strong>受注登録する品目にチェックを入れてください。</strong>チェックを外した品目は見積に残り、後からもう一度この画面を開いて個別に受注登録できます。販売単価は見積時点の単価をそのまま引き継ぎます。仕入先・仕入単価は現在の単価マスタから改めて検索した候補です。数量も変更できます(一部数量だけの受注登録も可能)。</p>
         <table>
           <tbody>
             <tr><td style={{width:140}}>見積番号</td><td>{quotation.quotationNo}</td></tr>
@@ -4792,25 +5169,42 @@ function QuotationConvertModal({quotation,data,update,onClose}){
           </tbody>
         </table>
         <div style={{marginTop:10}}>
-          <div style={{display:"grid",gridTemplateColumns:"1.4fr 70px 45px 80px 1.2fr 80px 60px",gap:4,padding:"6px",fontSize:10,color:"#888",fontWeight:"bold"}}>
+          <div className="flex" style={{marginBottom:4,gap:8}}>
+            <button className="btn btn-secondary btn-sm" onClick={()=>toggleAll(true)}>全て選択</button>
+            <button className="btn btn-secondary btn-sm" onClick={()=>toggleAll(false)}>全て解除</button>
+            <span style={{fontSize:11,color:"#666"}}>選択中 {selectedCount} / 受注登録できる品目 {selectableCount}</span>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"34px 1.4fr 70px 45px 80px 1.2fr 80px 60px",gap:4,padding:"6px",fontSize:10,color:"#888",fontWeight:"bold"}}>
+            <div className="text-center">選択</div>
             <div>商品</div><div className="text-center">数量</div><div className="text-center">単位</div>
             <div className="text-center">販売単価(凍結)</div><div className="text-center">仕入先(再取得)</div>
             <div className="text-center">仕入単価</div><div className="text-center">粗利</div>
           </div>
           {convItems.map((it,i)=>{
             const p = data.products.find(x=>x.id===it.productId);
-            const gp = (Number(it.qty||0)*Number(it.salePrice||0)) - (Number(it.qty||0)*Number(it.purchasePrice||0));
+            const done = Number(it.maxQty||0) <= 0;   // 残数量なし = 既に全数受注登録済み
+            const on = !!it.selected && !done;
+            const gp = on ? (Number(it.qty||0)*Number(it.salePrice||0)) - (Number(it.qty||0)*Number(it.purchasePrice||0)) : 0;
             return (
-              <div className="item-row" key={it.quotationItemId||i} style={{gridTemplateColumns:"1.4fr 70px 45px 80px 1.2fr 80px 60px"}}>
-                <div style={{fontSize:12}}>{p?.name||it.productId}</div>
-                <input type="number" step="0.01" value={it.qty} onChange={e=>setConvItem(i,"qty",e.target.value)}/>
+              <div className="item-row" key={it.quotationItemId||i}
+                   style={{gridTemplateColumns:"34px 1.4fr 70px 45px 80px 1.2fr 80px 60px", opacity: done?0.55:1, background: done?"#F5F7FA":undefined}}>
+                <div className="text-center">
+                  <input type="checkbox" checked={on} disabled={done} onChange={e=>setConvItem(i,"selected",e.target.checked)} style={{width:16,height:16}}/>
+                </div>
+                <div style={{fontSize:12}}>
+                  {p?.name||it.productId}
+                  {done
+                    ? <span className="badge badge-invoiced" style={{marginLeft:6}}>受注済</span>
+                    : (Number(it.orderedQty||0) > 0 && <span className="badge badge-created" style={{marginLeft:6}}>一部受注済 {it.orderedQty}/{it.totalQty}</span>)}
+                </div>
+                <input type="number" step="0.01" value={done?0:it.qty} disabled={!on} onChange={e=>setConvItem(i,"qty",e.target.value)}/>
                 <input readOnly value={it.unit||""} style={{background:"#F5F7FA",textAlign:"center"}}/>
                 <input readOnly value={"¥"+Number(it.salePrice||0).toLocaleString()} style={{background:"#DDE6F0",textAlign:"right"}}/>
-                <select value={it.supplierId||""} onChange={e=>setConvItem(i,"supplierId",e.target.value)}>
+                <select value={it.supplierId||""} disabled={!on} onChange={e=>setConvItem(i,"supplierId",e.target.value)}>
                   <option value="">未選択</option>
                   {suppliers.map(sp=><option key={sp.id} value={sp.id}>{sp.name}</option>)}
                 </select>
-                <input type="number" value={it.purchasePrice||0} onChange={e=>setConvItem(i,"purchasePrice",e.target.value)}/>
+                <input type="number" value={it.purchasePrice||0} disabled={!on} onChange={e=>setConvItem(i,"purchasePrice",e.target.value)}/>
                 <input readOnly value={"¥"+gp.toLocaleString()} style={{background:gp>=0?"#E2EFDA":"#FFCDCD",textAlign:"right"}}/>
               </div>
             );
@@ -4818,7 +5212,9 @@ function QuotationConvertModal({quotation,data,update,onClose}){
         </div>
         <div className="flex" style={{justifyContent:"flex-end",marginTop:12}}>
           <button className="btn btn-secondary" onClick={()=>onClose(false)}>キャンセル</button>
-          <button className="btn btn-success" disabled={isConverting} onClick={doConvert}>この内容で受注登録を確定</button>
+          <button className="btn btn-success" disabled={isConverting||selectedCount===0} onClick={doConvert}>
+            {isConverting ? "登録中..." : "選択した" + selectedCount + "品目を受注登録する"}
+          </button>
         </div>
       </div>
     </div>
@@ -5383,13 +5779,105 @@ function DeliveryNotePrintBody({s}){
   </>);
 }
 
+function InvoicePrintBody({s}){
+  return (<>
+    <CompanyHeader company={s.company}/>
+    <div className="grid-2" style={{marginBottom:10}}>
+      <div>
+        <div style={{fontSize:14,fontWeight:"bold",borderBottom:"1px solid #333",paddingBottom:4,marginBottom:6}}>{s.customer?.name||""} 御中</div>
+        {s.customer?.address && <div style={{fontSize:11}}>{s.customer.zip} {s.customer.address}</div>}
+        {s.customer?.registrationNumber && <div style={{fontSize:11}}>登録番号: {s.customer.registrationNumber}</div>}
+      </div>
+      <div style={{fontSize:11,textAlign:"right"}}>
+        <div>請求番号: {s.invoiceNo}</div>
+        <div>請求対象月: {s.targetMonth}</div>
+        <div>請求日: {fmtDate(s.issueDate)}</div>
+        <div>お支払期限: {s.dueDate?fmtDate(s.dueDate):"-"}</div>
+        {s.reissued && <div style={{color:"#DC3545",fontWeight:"bold"}}>再発行</div>}
+      </div>
+    </div>
+    <div style={{fontSize:14,fontWeight:"bold",marginBottom:6}}>
+      ご請求金額（税込）: <span className="price" style={{fontSize:18}}>{yen(s.total)}</span>
+    </div>
+    <table>
+      <thead><tr><th>納品日</th><th>取引No.</th><th>産地</th><th>商品</th><th className="text-right">数量</th><th>単位</th><th className="text-right">単価</th><th className="text-right">税率</th><th className="text-right">金額</th></tr></thead>
+      <tbody>
+        {(s.items||[]).map((it,i)=>(
+          <tr key={i}>
+            <td>{fmtDate(it.transactionDate)}</td><td>{it.transactionNo}</td><td>{it.sanchi}</td>
+            <td>{it.productName}</td><td className="text-right">{it.qty}</td><td>{it.unit}</td>
+            <td className="text-right">{yen(it.unitPrice)}</td><td className="text-right">{Math.round(it.taxRate*100)}%</td>
+            <td className="text-right">{yen(it.amount)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+    <TaxSummary subtotalByTaxRate={s.subtotalByTaxRate} taxByTaxRate={s.taxByTaxRate} total={s.total}/>
+    {s.company?.documentNote && <div style={{marginTop:6,fontSize:11,whiteSpace:"pre-wrap"}}>{s.company.documentNote}</div>}
+    <BankInfo company={s.company}/>
+  </>);
+}
+
 // 帳票種別ごとの見出し・本文切替。印刷/PDF保存はブラウザ標準のwindow.print()を使う
 // (外部PDFライブラリはCDN到達性に依存し、オフライン/CDN障害時に帳票が出せなくなるリスクがあるため採用しない。
 // window.print()なら常にブラウザ内蔵で、印刷ダイアログの出力先を「PDFに保存」にすればPDF化もできる)。
-function DocumentPrintView({doc,update,onClose}){
+function DocumentPrintView({doc,update,autoDrive,onClose}){
   const s = doc.snapshot || {};
-  const titleMap = {quotation:"見積書", purchase_order:"発注書", delivery_note:"納品書"};
+  const titleMap = DOCUMENT_TYPE_LABELS;
+  const printRef = React.useRef(null);
+  const [driveState,setDriveState] = useState(doc.driveFileUrl ? "saved" : "");  // "" / saving / saved / error
+  const [driveUrl,setDriveUrl] = useState(doc.driveFileUrl || "");
+  const [driveMsg,setDriveMsg] = useState("");
   const handleReissue = () => { update(d => reissueDocumentInData(d, doc.id)); };
+
+  // ---- 画面に表示されている帳票そのものをHTMLとして送り、GAS側でPDFに変換してドライブへ保存する。
+  // 保存先(フォルダ名)には必ず「肥料農薬」が入る。保存結果はdocumentsレコードに記録し、
+  // 一覧から後で開けるようにする。 ----
+  const saveToDrive = async () => {
+    const cfg = loadBackendConfig();
+    if (!cfg.url) {
+      setDriveState("error");
+      setDriveMsg("共有データベース(GAS)のURLが未設定です。設定タブでURLとアクセスコードを登録してください。");
+      return;
+    }
+    setDriveState("saving"); setDriveMsg("");
+    try {
+      const inner = printRef.current ? printRef.current.innerHTML : "";
+      const html = buildPrintableHtml(titleMap[doc.documentType]||"帳票", inner);
+      const r = await backendCall(cfg, {
+        action:"savePdf",
+        folderPath: driveFolderPathFor(doc),
+        fileName: driveFileNameFor(doc),
+        html,
+      });
+      if (!r || !r.ok) throw new Error((r && r.error) || "保存に失敗しました");
+      const res = r.result || {};
+      setDriveUrl(res.fileUrl||"");
+      setDriveState("saved");
+      setDriveMsg(res.folderPath||"");
+      const savedAt = new Date().toISOString();
+      await update(d => {
+        d.documents = (d.documents||[]).map(x => x.id===doc.id
+          ? {...x, driveFileId:res.fileId||null, driveFileUrl:res.fileUrl||"", driveFolderPath:res.folderPath||"", driveSavedAt:savedAt}
+          : x);
+        return d;
+      });
+    } catch(e) {
+      setDriveState("error");
+      setDriveMsg(String(e.message||e));
+    }
+  };
+
+  // 新規発行時(autoDrive)だけ、共有データベースが設定されていれば自動で保存する。
+  // 再表示のたびに保存すると同じPDFがドライブに増えてしまうため、初回のみ。
+  useEffect(()=>{
+    if (!autoDrive) return;
+    if (doc.driveFileId) return;
+    const cfg = loadBackendConfig();
+    if (!cfg.url) return;
+    saveToDrive();
+  },[]);
+
   return (
     <div className="print-page-wrap">
       <div className="no-print" style={{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:8,padding:"8px 20px",borderBottom:"1px solid #DDE6F0",marginBottom:10}}>
@@ -5397,15 +5885,25 @@ function DocumentPrintView({doc,update,onClose}){
           発行No: {doc.documentNo} ／ 発行日時: {new Date(doc.issuedAt).toLocaleString('ja-JP')}
           {doc.reissueCount>0 && ` ／ 再発行${doc.reissueCount}回`}
         </span>
+        {driveState==="saving" && <span style={{fontSize:11,color:"#1565C0"}}>Googleドライブへ保存中...</span>}
+        {driveState==="saved" && <span style={{fontSize:11,color:"#2E7D32"}}>
+          ドライブ保存済み{driveMsg && `（${driveMsg}）`}
+          {driveUrl && <> ／ <a href={driveUrl} target="_blank" rel="noreferrer">開く</a></>}
+        </span>}
+        {driveState==="error" && <span style={{fontSize:11,color:"#DC3545"}}>ドライブ保存に失敗: {driveMsg}</span>}
+        <button className="btn btn-secondary" disabled={driveState==="saving"} onClick={saveToDrive}>
+          {driveState==="saved" ? "ドライブへ再保存" : "Googleドライブへ保存"}
+        </button>
         <button className="btn btn-secondary" onClick={handleReissue}>再発行として記録</button>
         <button className="btn btn-primary" onClick={()=>window.print()}>印刷/PDF保存</button>
         <button className="btn btn-secondary" onClick={onClose}>閉じる</button>
       </div>
-      <div className="print-page">
+      <div className="print-page" ref={printRef}>
         <h2 style={{textAlign:"center",fontSize:20,marginBottom:16}}>{titleMap[doc.documentType]||doc.documentType}</h2>
         {doc.documentType==="quotation" && <QuotationPrintBody s={s}/>}
         {doc.documentType==="purchase_order" && <PurchaseOrderPrintBody s={s}/>}
         {doc.documentType==="delivery_note" && <DeliveryNotePrintBody s={s}/>}
+        {doc.documentType==="invoice" && <InvoicePrintBody s={s}/>}
       </div>
     </div>
   );
